@@ -1,0 +1,16 @@
+HumanDetector_1_Setup.exe
+
+# Ignore build files and directories
+dist/*
+build/*
+build/humanDetector/humanDetector.pkg
+
+# Ignore Python-specific cache directory
+__pycache__/*
+
+# Ignore virtual environment directory
+yoloenv/*
+
+# Ignore specific files and directories
+pjreddie.com/*
+model_data/*

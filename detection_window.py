@@ -1,0 +1,181 @@
+import os
+import cv2
+import numpy as np
+import tensorflow as tf
+from yolov3.utils import Load_Yolo_model, image_preprocess, postprocess_boxes, nms, draw_bbox, read_class_names
+from yolov3.configs import *
+import time
+
+from deep_sort import nn_matching
+from deep_sort.detection import Detection
+from deep_sort.tracker import Tracker
+from deep_sort import generate_detections as gdet
+import pygame
+
+class ObjectTracking:
+    def __init__(self, video_path=0, output_path="detection2.avi", input_size=416, show=True,
+                 CLASSES=YOLO_COCO_CLASSES, score_threshold=0.3, iou_threshold=0.45, rectangle_colors='',
+                 Track_only=["person"], yolo_model=None):  # Add yolo_model parameter
+        self.Yolo = yolo_model if yolo_model else Load_Yolo_model()
+        self.video_path = video_path
+        self.output_path = output_path
+        self.input_size = input_size
+        self.show = show
+        self.CLASSES = CLASSES
+        self.score_threshold = score_threshold
+        self.iou_threshold = iou_threshold
+        self.rectangle_colors = rectangle_colors
+        self.Track_only = Track_only
+
+        # Initialize pygame mixer
+        pygame.mixer.init()
+        # Load alarm sound file
+        self.alarm_sound_file = 'sound/beep-warning-6387.mp3'  # Replace with the path to your alarm sound file
+        pygame.mixer.music.load(self.alarm_sound_file)
+
+    def play_alarm(self):
+        pygame.mixer.music.play()
+
+    def run(self):
+        # Definition of the parameters
+        max_cosine_distance = 0.7
+        nn_budget = None
+
+        # initialize deep sort object
+        model_filename = 'model_data/mars-small128.pb'
+        encoder = gdet.create_box_encoder(model_filename, batch_size=1)
+        metric = nn_matching.NearestNeighborDistanceMetric("cosine", max_cosine_distance, nn_budget)
+        tracker = Tracker(metric)
+
+        times, times_2 = [], []
+
+        if self.video_path:
+            vid = cv2.VideoCapture(self.video_path)  # detect on video
+        elif self.video_path is None:
+            vid = cv2.VideoCapture(1)
+        else:
+            vid = cv2.VideoCapture(0)  # detect from webcam
+
+        # by default VideoCapture returns float instead of int
+        width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(vid.get(cv2.CAP_PROP_FPS))
+        codec = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(self.output_path, codec, fps, (width, height))  # output_path must be .mp4
+
+        NUM_CLASS = read_class_names(self.CLASSES)
+        key_list = list(NUM_CLASS.keys())
+        val_list = list(NUM_CLASS.values())
+
+        while True:
+            _, frame = vid.read()
+
+            try:
+                original_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                original_frame = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
+            except:
+                break
+
+            image_data = image_preprocess(np.copy(original_frame), [self.input_size, self.input_size])
+            image_data = image_data[np.newaxis, ...].astype(np.float32)
+
+            t1 = time.time()
+            if YOLO_FRAMEWORK == "tf":
+                pred_bbox = self.Yolo.predict(image_data)
+            elif YOLO_FRAMEWORK == "trt":
+                batched_input = tf.constant(image_data)
+                result = self.Yolo(batched_input)
+                pred_bbox = []
+                for key, value in result.items():
+                    value = value.numpy()
+                    pred_bbox.append(value)
+
+            t2 = time.time()
+
+            pred_bbox = [tf.reshape(x, (-1, tf.shape(x)[-1])) for x in pred_bbox]
+            pred_bbox = tf.concat(pred_bbox, axis=0)
+
+            bboxes = postprocess_boxes(pred_bbox, original_frame, self.input_size, self.score_threshold)
+            bboxes = nms(bboxes, self.iou_threshold, method='nms')
+
+            # extract bboxes to boxes (x, y, width, height), scores and names
+            boxes, scores, names = [], [], []
+            for bbox in bboxes:
+                if len(self.Track_only) != 0 and NUM_CLASS[int(bbox[5])] in self.Track_only or len(self.Track_only) == 0:
+                    boxes.append([bbox[0].astype(int), bbox[1].astype(int),
+                                  bbox[2].astype(int) - bbox[0].astype(int), bbox[3].astype(int) - bbox[1].astype(int)])
+                    scores.append(bbox[4])
+                    names.append(NUM_CLASS[int(bbox[5])])
+
+            # Obtain all the detections for the given frame.
+            boxes = np.array(boxes)
+            names = np.array(names)
+            scores = np.array(scores)
+            features = np.array(encoder(original_frame, boxes))
+            detections = [Detection(bbox, score, class_name, feature) for bbox, score, class_name, feature in
+                          zip(boxes, scores, names, features)]
+
+            # Pass detections to the deepsort object and obtain the track information.
+            tracker.predict()
+            tracker.update(detections)
+
+            # Obtain info from the tracks
+            tracked_bboxes = []
+            alarm_triggered = False  # Flag to check if the alarm has been triggered
+            person_count = 0  # Initialize person count for each frame
+
+            for track in tracker.tracks:
+                if not track.is_confirmed() or track.time_since_update > 10:
+                    continue
+                bbox = track.to_tlbr()
+                class_name = track.get_class()
+                tracking_id = track.track_id
+                index = key_list[val_list.index(class_name)]
+                tracked_bboxes.append(bbox.tolist() + [tracking_id, index])
+
+                # Check if the tracked object is a person and trigger the alarm
+                if class_name == "person":
+                    person_count += 1
+                    alarm_triggered = True
+
+            # draw detection on frame
+            image = draw_bbox(original_frame, tracked_bboxes, CLASSES=self.CLASSES, tracking=True)
+
+            # Display person count at the right corner of the screen
+            count_text = "Person Count: {}".format(person_count)
+            image = cv2.putText(image, count_text, (width - 200, 60), cv2.FONT_HERSHEY_COMPLEX_SMALL, 1, (0, 255, 0), 2)
+
+            t3 = time.time()
+            times.append(t2 - t1)
+            times_2.append(t3 - t1)
+
+            times = times[-20:]
+            times_2 = times_2[-20:]
+
+            ms = sum(times) / len(times) * 1000
+            fps = 1000 / ms
+            fps2 = 1000 / (sum(times_2) / len(times_2) * 1000)
+
+            image = cv2.putText(image, "Time: {:.1f} FPS".format(fps), (0, 30), cv2.FONT_HERSHEY_COMPLEX_SMALL, 1,
+                                (0, 0, 255), 2)
+
+            if alarm_triggered:
+                self.play_alarm()
+
+            print("Time: {:.2f}ms, Detection FPS: {:.1f}, total FPS: {:.1f}".format(ms, fps, fps2))
+            if self.output_path != '':
+                out.write(image)
+            if self.show:
+                cv2.imshow('output', image)
+
+                if cv2.waitKey(25) & 0xFF == ord("q"):
+                    cv2.destroyAllWindows()
+                    break
+
+        cv2.destroyAllWindows()
+
+
+# # Example usage:
+# tracking_instance = ObjectTracking(video_path=0, output_path="detection2.mp4", input_size=YOLO_INPUT_SIZE,
+#                                    show=True, iou_threshold=0.1, rectangle_colors=(255, 0, 0), Track_only=["person"])
+# tracking_instance.run()
